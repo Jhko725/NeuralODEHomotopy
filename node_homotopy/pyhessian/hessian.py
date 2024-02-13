@@ -19,10 +19,10 @@
 # *
 
 import torch
-import pytorch_lightning as pl
+import lightning
 import more_itertools
-from torch.autograd import Variable
 import numpy as np
+import matplotlib.pyplot as plt
 
 from .utils import (
     group_product,
@@ -44,25 +44,26 @@ class hessian:
 
     def __init__(
         self,
-        model: pl.LightningModule,
+        model: lightning.LightningModule,
         dataloader: torch.utils.data.DataLoader,
-        cuda=True,
+        cuda: bool = True,
     ):
         """
         model: the model that needs Hessain information
         data: a single batch of data, including inputs and its corresponding labels
         dataloader: the data loader including bunch of batches of data
         """
+        # Make the original PyHessian code play nicely with Lightning
+        # Using lightning.Fabric will auto-manage the devices on which the computation is performed on.
+        accel = "cuda" if cuda else "cpu"
+        self.fabric = lightning.Fabric(accelerator=accel, devices=1)
+        self.fabric.launch()
 
-        self.model = model.eval()  # make model is in evaluation model
+        self.model = self.fabric.setup_module(model)
+        self.model.eval()  # Set model to eval mode
+        self.data = self.fabric.setup_dataloaders(dataloader)
 
-        self.data = dataloader
-        self.is_single_batch = len(dataloader) == 1
-
-        if cuda:
-            self.device = "cuda"
-        else:
-            self.device = "cpu"
+        self.is_single_batch = len(self.data) == 1
 
         # pre-processing for single batch case to simplify the computation.
         if self.is_single_batch:
@@ -75,6 +76,10 @@ class hessian:
         params, gradsH = get_params_grad(self.model)
         self.params = params
         self.gradsH = gradsH  # gradient used for Hessian computation
+
+    @property
+    def device(self) -> torch.device:
+        return self.model.device
 
     def dataloader_hv_product(self, v):
         device = self.device
@@ -189,63 +194,66 @@ class hessian:
         iter: number of iterations used to compute trace
         n_v: number of SLQ runs
         """
-
-        device = self.device
         eigen_list_full = []
         weight_list_full = []
 
-        for k in range(n_v):
-            v = [torch.randint_like(p, high=2, device=device) for p in self.params]
-            # generate Rademacher random variables
-            for v_i in v:
-                v_i[v_i == 0] = -1
-            v = normalization(v)
+        with torch.device(self.device):
+            for _ in range(n_v):
+                v = [torch.randint_like(p, high=2) for p in self.params]
+                # generate Rademacher random variables
+                for v_i in v:
+                    v_i[v_i == 0] = -1
+                v = normalization(v)
 
-            # standard lanczos algorithm initlization
-            v_list = [v]
-            w_list = []
-            alpha_list = []
-            beta_list = []
-            ############### Lanczos
-            for i in range(iter):
-                self.model.zero_grad()
-                w_prime = [torch.zeros(p.size()).to(device) for p in self.params]
-                if i == 0:
-                    if self.is_single_batch:
-                        w_prime = hessian_vector_product(self.gradsH, self.params, v)
+                # standard lanczos algorithm initlization
+                v_list = [v]
+                w_list = []
+                alpha_list = []
+                beta_list = []
+                ############### Lanczos
+                for i in range(iter):
+                    self.model.zero_grad()
+                    w_prime = [torch.zeros(p.size()) for p in self.params]
+                    if i == 0:
+                        if self.is_single_batch:
+                            w_prime = hessian_vector_product(
+                                self.gradsH, self.params, v
+                            )
+                        else:
+                            _, w_prime = self.dataloader_hv_product(v)
+                        alpha = group_product(w_prime, v)
+                        alpha_list.append(alpha.cpu().item())
+                        w = group_add(w_prime, v, alpha=-alpha)
+                        w_list.append(w)
                     else:
-                        _, w_prime = self.dataloader_hv_product(v)
-                    alpha = group_product(w_prime, v)
-                    alpha_list.append(alpha.cpu().item())
-                    w = group_add(w_prime, v, alpha=-alpha)
-                    w_list.append(w)
-                else:
-                    beta = torch.sqrt(group_product(w, w))
-                    beta_list.append(beta.cpu().item())
-                    if beta_list[-1] != 0.0:
-                        # We should re-orth it
-                        v = orthnormal(w, v_list)
-                        v_list.append(v)
-                    else:
-                        # generate a new vector
-                        w = [torch.randn(p.size()).to(device) for p in self.params]
-                        v = orthnormal(w, v_list)
-                        v_list.append(v)
-                    if self.is_single_batch:
-                        w_prime = hessian_vector_product(self.gradsH, self.params, v)
-                    else:
-                        _, w_prime = self.dataloader_hv_product(v)
-                    alpha = group_product(w_prime, v)
-                    alpha_list.append(alpha.cpu().item())
-                    w_tmp = group_add(w_prime, v, alpha=-alpha)
-                    w = group_add(w_tmp, v_list[-2], alpha=-beta)
+                        beta = torch.sqrt(group_product(w, w))
+                        beta_list.append(beta.cpu().item())
+                        if beta_list[-1] != 0.0:
+                            # We should re-orth it
+                            v = orthnormal(w, v_list)
+                            v_list.append(v)
+                        else:
+                            # generate a new vector
+                            w = [torch.randn(p.size()) for p in self.params]
+                            v = orthnormal(w, v_list)
+                            v_list.append(v)
+                        if self.is_single_batch:
+                            w_prime = hessian_vector_product(
+                                self.gradsH, self.params, v
+                            )
+                        else:
+                            _, w_prime = self.dataloader_hv_product(v)
+                        alpha = group_product(w_prime, v)
+                        alpha_list.append(alpha.cpu().item())
+                        w_tmp = group_add(w_prime, v, alpha=-alpha)
+                        w = group_add(w_tmp, v_list[-2], alpha=-beta)
 
-            T = torch.zeros(iter, iter).to(device)
-            for i in range(len(alpha_list)):
-                T[i, i] = alpha_list[i]
-                if i < len(alpha_list) - 1:
-                    T[i + 1, i] = beta_list[i]
-                    T[i, i + 1] = beta_list[i]
+                T = torch.zeros(iter, iter)
+                for i in range(len(alpha_list)):
+                    T[i, i] = alpha_list[i]
+                    if i < len(alpha_list) - 1:
+                        T[i + 1, i] = beta_list[i]
+                        T[i, i + 1] = beta_list[i]
             a_, b_ = torch.linalg.eig(T)
 
             eigen_list = a_.real
@@ -255,12 +263,6 @@ class hessian:
             weight_list_full.append(list(weight_list.cpu().numpy()))
 
         return eigen_list_full, weight_list_full
-
-
-import numpy as np
-import matplotlib as mpl
-
-import matplotlib.pyplot as plt
 
 
 def get_esd_plot(eigenvalues, weights):

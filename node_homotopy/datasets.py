@@ -1,149 +1,162 @@
+# ruff: noqa: F722
 from __future__ import annotations
-from pathlib import Path
-from typing import Sequence
-from functools import reduce
-from operator import add
+from typing import Any, TypedDict, Literal
 
-import numpy as np
 import torch
 from torch import Tensor
+from jaxtyping import Float
 
 from .dynamics import AbstractDynamics
+from .odesolve import odesolve
 
 
-class IVPDataset(torch.utils.data.Dataset):
-    def __init__(self, t: Tensor, u0: Tensor, u: Tensor):
+class DynamicsDatasetBatch(TypedDict):
+    t: Float[Tensor, "*batch time"]
+    u: Float[Tensor, "*batch dof time"]
+    u0: Float[Tensor, "*batch dof"]
+
+
+class DynamicsDataset(torch.utils.data.Dataset):
+    """PyTorch dataset of trajectories generated from dynamical systems.
+
+    The trajectories can be multidimensional, but assumes that all trajectories share
+    the same time points.
+    The initial conditions for each trajectories can either be directly given or be omitted.
+    In the latter case, the initial conditions will be set to the trajectory values at the first time point.
+
+    Attributes:
+        t: Tensor of time points for the trajectories. Must be monotonically increasing.
+           Does not have to be equispaced. Has shape (N, ); N = number of time points.
+        u: Tensor of the state values for the trajectories.
+            Has shape (B, M, N); B = number of trajectories, M = dimensionality of the state vector, N = number of time points.
+        u0: Tensor of the initial conditions for the trajectories.
+            Has shape (B, M); ; B = number of trajectories, M = dimensionality of the state vector
+        random_seed: Seed value used to generate the noise values added on to the trajectories
+            Not relevant if self.add_noise() is not used. Can be set to None, which corresponds to not using a fixed random seed.
+        noise_amplitude: Tensor denoting the amplitude (standard deviation) of the Gaussian noise added to the original trajectory via self.add_noise().
+            Not relevant if self.add_noise() is not used.
+        n_dim: Integer value denoting the dimensionality of the state vector. If the states are from a fully observed dynamical system,
+            this value is equal to the degree of freedom of the dynamics.
+    """
+
+    def __init__(
+        self,
+        t: Float[Tensor, " time"],
+        u: Float[Tensor, "samples dof time"],
+        u0: Float[Tensor, "samples dof"] | None = None,
+    ):
+        """Initializes the class by constructing the dataset.
+
+        Args:
+            t: Tensor of time points for the trajectories. Must be monotonically increasing.
+                Does not have to be equispaced. Has shape (N, ); N = number of time points.
+            u: Tensor of the state values for the trajectories.
+                Has shape (B, M, N); B = number of trajectories, M = dimensionality of the state vector, N = number of time points.
+            u0: Tensor of the initial conditions for the trajectories. Defaults to None, in which case, it is set to the value of u
+                corresponding to the first time point of t. Has shape (B, M); B = number of trajectories, M = dimensionality of the state vector
+        """
         super().__init__()
-        self.t = Tensor(t)  # (time)
-        self.u0 = Tensor(u0)  # (samples, dof)
-        self.u = Tensor(u)  # (samples, dof, time)
-        self.random_seed = None
-        self.noise_amplitude = 0.0
-
-    def __len__(self) -> int:
-        return self.u0.size(0)  # array.shape[0]
+        self.t = Tensor(t)
+        self.u = Tensor(u)
+        self.u0 = Tensor(u0) if u0 is not None else self.u[..., 0]
+        self.random_seed: int | None = None
+        self.noise_amplitude: Float[Tensor, ""] | Float[
+            Tensor, "samples dof 1"
+        ] = torch.tensor(0.0)
 
     @property
-    def dof(self) -> int:
-        return self.u0.size(1)
+    def n_dim(self) -> int:
+        """Dimensionality of the state vector.
 
-    def __getitem__(self, idx) -> dict:
-        sample = {"t": self.t, "u0": self.u0[idx], "u": self.u[idx]}
+        Returns:
+            n_dim: Integer corresponding to the dimensionality of the state vector.
+        """
+        return self.u0.shape[1]
+
+    def __len__(self) -> int:
+        """Corresponds to the number of samples in the dataset: i.e., the number of trajectories.
+
+        Returns:
+            n_samples: Integer corresponding to the number of trajectories in the dataset.
+        """
+        return self.u0.shape[0]
+
+    def __getitem__(self, idx: Any) -> DynamicsDatasetBatch:
+        """Fetches the trajectories in the dataset corresponding to idx.
+
+        Args:
+            idx: Any object that can index into a PyTorch Tensor
+
+        Returns:
+            sample: Dictionary containing the trajectories corresponding to idx.
+                The dictionary has three fields: t, u, and u0 with shapes (N, ), (*, M, N), and (*, M)
+                where N = number of time points, M = dimensionality of the state vector, and
+                * can be zero or one dimension corresponding to number of trajectories in the sample.
+        """
+        sample = {"t": self.t, "u": self.u[idx], "u0": self.u0[idx]}
         return sample
 
     def add_noise(
         self,
-        strength: float,
-        relative_to: str | None = None,
+        amplitude: float,
+        relative_to: Literal["mean"] | None = None,
         random_seed: int | None = 10,
     ) -> None:
+        """Adds Gaussian noise to the trajectories in the dataset.
+
+        Does not add noise to the initial condition values. Calling this function modifies the self.random_seed and self.noise_amplitude attributes.
+
+        Args:
+            amplitude: Determines the standard deviation of the Gaussian noise to be added.
+                If relative_to = None, standard deviation = amplitude for all sample and state dimension.
+                If relative_to = "mean", standard deviation = (mean of the trajectory over time) * amplitude, for each sample and state dimension.
+        """
         if random_seed is not None:
             self.random_seed = random_seed
             torch.manual_seed(self.random_seed)
 
-        noise = strength * torch.normal(mean=0.0, std=torch.ones_like(self.u))
-        self.noise_amplitude = strength
-
         match relative_to:
             case None:
-                pass
+                self.noise_amplitude = torch.tensor(amplitude)
             case "mean":
-                mean = torch.mean(self.u, dim=-1).unsqueeze(-1)
-                noise *= mean
-                self.noise_amplitude = self.noise_amplitude * mean
+                mean = torch.mean(self.u, dim=-1, keepdim=True)
+                self.noise_amplitude = amplitude * mean
             case _:
                 raise ValueError(
                     "Unsupported value for relative to: currently supports None or mean"
                 )
+
+        noise = self.noise_amplitude * torch.normal(
+            mean=0.0, std=torch.ones_like(self.u)
+        )
         self.u += noise
 
-    def subset_by_batch(self, batch_idx) -> IVPDataset:
-        t_subset = self.t if len(self.t.size()) == 1 else self.t[batch_idx]
-        u0_subset = self.u0[batch_idx]
-        u_subset = self.u[batch_idx]
+    @classmethod
+    def from_dynamics(
+        cls,
+        dynamics: AbstractDynamics,
+        u0: Float[Tensor, "samples n_dims"],
+        t: Float[Tensor, " time"],
+        **odesolve_kwargs,
+    ) -> DynamicsDataset:
+        """Constructs the dataset from a given AbstractDynamics.
 
-        match batch_idx:
-            case int:
-                u0_subset = u0_subset.unsqueeze(0)
-                u_subset = u_subset.unsqueeze(0)
+        The given dynamics is solved using the initial condition u0 and the time points t, then the result is packaged into a DynamicsDataset.
 
-        return IVPDataset(t_subset, u0_subset, u_subset)
+        Args:
+            dynamics: AbstractDynamics to create the dataset from.
+            u0: Tensor of initial condition to solve the dynamics with.
+            t: Tensor of time points to solve the dynamics at.
+            **odesolve_kwargs: Keyword arguments to be passed to node_homotopy.odesolve.odesolve.
 
-    def subset_by_time(self, time_idx) -> IVPDataset:
-        t_subset = self.t[..., time_idx]
-        u_subset = self.u[..., time_idx]
-        return IVPDataset(t_subset, self.u0, u_subset)
+        Returns:
+            dataset: DynamicsDataset containing the corresponding solution to the dynamics.
+        """
+        if dynamics.dof != u0.shape[1]:
+            raise ValueError(
+                "The dimensionality of the initial condition tensor u0 is different from the degree of freedom of the dynamics"
+            )
+        with torch.no_grad():
+            u = odesolve(dynamics, u0, t, **odesolve_kwargs)
 
-
-def make_dynamics_dataset(
-    dynamics: AbstractDynamics,
-    u0: Sequence,
-    tspan: tuple[float, float],
-    dt: float,
-    **odesolve_kwargs,
-) -> IVPDataset:
-    u0 = torch.as_tensor(u0)
-    if len(u0.size()) == 1:
-        u0 = u0.view(1, -1)
-    t = torch.arange(*tspan, dt)
-    u = dynamics.solve(u0, t, enable_grad=False, **odesolve_kwargs)
-    return IVPDataset(t, u0, u)
-
-
-class SchmidtDataset(IVPDataset):
-    def __init__(self, filepath: Path | str, segment_length: int = 300):
-        t, u = read_schmidt_data(filepath, segment_length=segment_length)
-        u0 = u[..., 0]
-        super().__init__(t, u0, u)
-
-    @property
-    def dof(self):
-        return self.u0.size(1)
-
-
-def read_schmidt_data(
-    filepath: Path | str, segment_length: int
-) -> tuple[np.ndarray, np.ndarray]:
-    raw_data = np.genfromtxt(Path(filepath), delimiter=" ", skip_header=1)
-    raw_data = raw_data[:, 0:6]  # Discard unneeded columns
-    trajs = _split_data_by_id(raw_data)
-    segments = _segment_trajectories(trajs, segment_length)
-    stacked = np.stack(segments, axis=0)
-    # (sample(1), num_data(819), (time, theta1, theta2, w1, w2) = 5)
-    # (sample(2), num_data(701), (time, theta1, theta2, w1, w2) = 5)
-    t, u = stacked[..., 0], stacked[..., 1:].transpose(0, 2, 1)
-    t = t - np.expand_dims(t[:, 0], axis=-1)
-    # t.shape: (sample, min_time) = (2, 701)
-    # without transpose ->
-    # u.shape: (sample, min_time, dof = 4 = (theta1, theta2, w1, w2))
-    # Need to transpose (0, 2, 1) to match the IVPDataset u shape: (sample, dof, time) = (2,4,701)
-    return t, u
-
-
-def _split_data_by_id(raw_data: np.ndarray) -> list[np.ndarray]:
-    trial_ids = np.unique(raw_data[:, 0])
-    trajectories = [raw_data[raw_data[:, 0] == id, 1:] for id in trial_ids]
-    return trajectories
-
-
-def _segment_trajectories(
-    trajectories: list[np.ndarray], segment_length: int
-) -> list[np.ndarray]:
-    segment_list = reduce(
-        add,
-        [_segment_trajectory(traj, segment_length) for traj in trajectories],
-    )
-    return segment_list
-
-
-def _segment_trajectory(
-    trajectory: np.ndarray, segment_length: int
-) -> list[np.ndarray]:
-    n_segments = len(trajectory) // segment_length
-    return np.split(trajectory[: n_segments * segment_length], n_segments)
-
-
-def _stack_trajectories(trajectories: list[np.ndarray]) -> np.ndarray:
-    min_length = np.min([traj.shape[0] for traj in trajectories])
-    stacked = np.stack([traj[0:min_length, :] for traj in trajectories], axis=0)
-    return stacked
+        return cls(t, u, u0)
